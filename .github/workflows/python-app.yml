@@ -5,6 +5,7 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -26,6 +27,24 @@ jobs:
         python -m pip install --upgrade pip
         pip install aiogram==3.1.1 python-dotenv==1.0.0
     
+    - name: Create .env file
+      run: |
+        echo "BOT_TOKEN=${{ secrets.BOT_TOKEN }}" >> .env
+        echo "OWNERS=${{ secrets.OWNERS }}" >> .env
+        echo "MAIN_CHANNEL=${{ secrets.MAIN_CHANNEL }}" >> .env
+        echo "BASE_CHANNEL_ID=${{ secrets.BASE_CHANNEL_ID }}" >> .env
+        echo "AUTHOR_USERNAME=@yolgizyigit7" >> .env
+        echo "AUTHOR_LINK=https://t.me/yolgizyigit7" >> .env
+        echo "SUPPORT_USERNAME=@yolgizyigit7" >> .env
+        echo "SUPPORT_LINK=https://t.me/yolgizyigit7" >> .env
+        echo "DATABASE_NAME=anime.db" >> .env
+        echo "LOG_LEVEL=INFO" >> .env
+    
     - name: Check bot can import
       run: |
         python -c "import Animedia"
+        echo "✅ Bot import successful!"
+    
+    - name: Show .env check
+      run: |
+        python -c "import os; from dotenv import load_dotenv; load_dotenv(); print('BOT_TOKEN:', 'SET' if os.getenv('BOT_TOKEN') else 'NOT SET')"
