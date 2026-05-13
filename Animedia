@@ -1,0 +1,2085 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Animedia FUN DUB Bot
+Muallif: @yolgizyigit7
+"""
+
+import asyncio
+import logging
+import sqlite3
+import os
+import re
+import io
+from datetime import datetime
+from dotenv import load_dotenv
+
+# .env faylini yuklash
+load_dotenv()
+
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command
+from aiogram.types import (
+    ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup,
+    InlineKeyboardButton, CallbackQuery, FSInputFile, BufferedInputFile
+)
+from aiogram.fsm.state import StatesGroup, State
+from aiogram.fsm.context import FSMContext
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+
+# ================================================================
+# KONFIGURATSIYA (.env dan olinadi)
+# ================================================================
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+OWNERS = [int(x.strip()) for x in os.getenv("OWNERS", "").split(",") if x.strip()]
+ADMINS = OWNERS.copy()  # Adminlar = Ownerlar
+MAIN_CHANNEL = os.getenv("MAIN_CHANNEL", "@animedia_fandub")
+AUTHOR_USERNAME = os.getenv("AUTHOR_USERNAME", "@yolgizyigit7")
+AUTHOR_LINK = os.getenv("AUTHOR_LINK", "https://t.me/yolgizyigit7")
+SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "@yolgizyigit7")
+SUPPORT_LINK = os.getenv("SUPPORT_LINK", "https://t.me/yolgizyigit7")
+BASE_CHANNEL_ID = int(os.getenv("BASE_CHANNEL_ID", "-1003888128587"))
+DB_NAME = os.getenv("DATABASE_NAME", "anime.db")
+
+# Bot token tekshiruvi
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN .env faylida topilmadi!")
+
+# ========== DATABASE ==========
+conn = sqlite3.connect(DB_NAME, check_same_thread=False)
+cursor = conn.cursor()
+
+# Media jadvali
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS media (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code INTEGER UNIQUE,
+    type TEXT,
+    name TEXT UNIQUE,
+    description TEXT,
+    image_url TEXT,
+    genre TEXT,
+    status TEXT DEFAULT "ongoing",
+    season INTEGER DEFAULT 1,
+    total_parts INTEGER DEFAULT 0,
+    views INTEGER DEFAULT 0,
+    voice TEXT DEFAULT "",
+    sponsor TEXT DEFAULT "",
+    quality TEXT DEFAULT "720p",
+    rating REAL DEFAULT 0.0,
+    rating_count INTEGER DEFAULT 0,
+    created_at TEXT
+)
+''')
+
+# Qismlar jadvali
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS parts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    media_id INTEGER,
+    part_number INTEGER,
+    file_id TEXT,
+    caption TEXT,
+    created_at TEXT,
+    FOREIGN KEY (media_id) REFERENCES media (id) ON DELETE CASCADE
+)
+''')
+
+# Foydalanuvchilar jadvali
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY,
+    username TEXT,
+    first_name TEXT,
+    last_name TEXT,
+    is_blocked INTEGER DEFAULT 0,
+    registered_at TEXT,
+    last_active TEXT
+)
+''')
+
+# Adminlar jadvali
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS admins (
+    user_id INTEGER PRIMARY KEY,
+    added_by INTEGER,
+    added_at TEXT
+)
+''')
+
+# Majburiy kanallar jadvali (endi Instagram va YouTube ham qo'shiladi)
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS forced_channels (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel_username TEXT UNIQUE,
+    channel_type TEXT DEFAULT "telegram",
+    is_active INTEGER DEFAULT 1
+)
+''')
+
+# Rating jadvali
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS ratings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    media_id INTEGER,
+    rating INTEGER,
+    created_at TEXT,
+    UNIQUE(user_id, media_id)
+)
+''')
+
+# Ownerlarni adminlarga qo'shish
+now = datetime.now().isoformat()
+for owner_id in OWNERS:
+    cursor.execute("INSERT OR IGNORE INTO admins (user_id, added_by, added_at) VALUES (?, ?, ?)",
+                   (owner_id, owner_id, now))
+conn.commit()
+print("✅ Database muvaffaqiyatli yuklandi!")
+
+# ========== BOT ==========
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+logging.basicConfig(level=logging.INFO)
+
+# ========== LOCAL RASMLAR ==========
+START_IMAGE_PATH = "Animedia.png"
+ADMIN_IMAGE_PATH = "admin.png"
+
+def get_start_image():
+    return FSInputFile(START_IMAGE_PATH) if os.path.exists(START_IMAGE_PATH) else None
+
+def get_admin_image():
+    return FSInputFile(ADMIN_IMAGE_PATH) if os.path.exists(ADMIN_IMAGE_PATH) else None
+
+# ========== STATE'LAR ==========
+class AddMediaState(StatesGroup):
+    type = State()
+    name = State()
+    code = State()
+    description = State()
+    image = State()
+    genre = State()
+    status = State()
+    season = State()
+    voice = State()
+    sponsor = State()
+    quality = State()
+
+class AddPartState(StatesGroup):
+    select_media = State()
+    part_number = State()
+    video = State()
+    caption = State()
+
+class AddMultiplePartsState(StatesGroup):
+    select_media = State()
+    videos = State()
+
+class EditMediaState(StatesGroup):
+    select = State()
+    field = State()
+    value = State()
+
+class EditPartState(StatesGroup):
+    select_media = State()
+    select_part = State()
+    field = State()
+    value = State()
+
+class BroadcastState(StatesGroup):
+    message = State()
+
+class AdminManageState(StatesGroup):
+    action = State()
+    user_id = State()
+
+class SearchState(StatesGroup):
+    query = State()
+    search_type = State()
+
+class PostState(StatesGroup):
+    media_id = State()
+    channel = State()
+    confirm = State()
+
+class PartPostState(StatesGroup):
+    media_id = State()
+    part_id = State()
+    channel = State()
+    confirm = State()
+
+class CodeSearchState(StatesGroup):
+    waiting_for_code = State()
+
+class ForcedChannelState(StatesGroup):
+    action = State()
+    channel = State()
+    channel_type = State()
+
+class RatingState(StatesGroup):
+    waiting_for_rating = State()
+
+# ========== TUGMALAR ==========
+def start_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔍 Kod orqali qidiruv", callback_data="search_by_code")],
+        [InlineKeyboardButton(text="🎬 Anime Qidiruv", callback_data="search_anime"),
+         InlineKeyboardButton(text="🎭 Drama Qidiruv", callback_data="search_drama")],
+        [InlineKeyboardButton(text="⭐ Reyting berish", callback_data="rate_anime")],
+        [InlineKeyboardButton(text="📖 Qo'llanma", callback_data="guide"),
+         InlineKeyboardButton(text="📋 Ro'yxat", callback_data="list_all")],
+        [InlineKeyboardButton(text="🔐 Admin Panel", callback_data="admin_panel")]
+    ])
+
+def admin_menu():
+    return ReplyKeyboardMarkup(keyboard=[
+        [KeyboardButton(text="➕ Media Qo'shish"), KeyboardButton(text="➕ Qism Qo'shish")],
+        [KeyboardButton(text="➕ Ko'p Qism Qo'shish"), KeyboardButton(text="✏️ Media Tahrirlash")],
+        [KeyboardButton(text="✏️ Qismni Tahrirlash"), KeyboardButton(text="📊 Statistika")],
+        [KeyboardButton(text="📢 Xabar Yuborish"), KeyboardButton(text="🔗 Majburiy A'zo")],
+        [KeyboardButton(text="👑 Admin Qo'shish"), KeyboardButton(text="📨 Post Qilish")],
+        [KeyboardButton(text="🎬 Qismni Post Qilish"), KeyboardButton(text="🔙 Asosiy menyu")]
+    ], resize_keyboard=True)
+
+def admin_manage_buttons():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Admin Qo'shish", callback_data="admin_add")],
+        [InlineKeyboardButton(text="❌ Admin Chiqarish", callback_data="admin_remove")],
+        [InlineKeyboardButton(text="🔙 Orqaga", callback_data="back_to_admin_reply")]
+    ])
+
+def forced_channel_buttons():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Telegram kanal", callback_data="forced_add_telegram")],
+        [InlineKeyboardButton(text="📸 Instagram", callback_data="forced_add_instagram")],
+        [InlineKeyboardButton(text="▶️ YouTube", callback_data="forced_add_youtube")],
+        [InlineKeyboardButton(text="❌ Kanal chiqarish", callback_data="forced_remove")],
+        [InlineKeyboardButton(text="🔙 Orqaga", callback_data="back_to_admin_reply")]
+    ])
+
+def forced_channel_list_keyboard(page=0):
+    builder = InlineKeyboardBuilder()
+    cursor.execute("SELECT id, channel_username, channel_type, is_active FROM forced_channels ORDER BY channel_type, channel_username")
+    channels = cursor.fetchall()
+    per_page = 10
+    start = page * per_page
+    for ch_id, channel, ch_type, active in channels[start:start+per_page]:
+        status = "✅" if active else "❌"
+        type_emoji = "📢" if ch_type == "telegram" else "📸" if ch_type == "instagram" else "▶️"
+        builder.button(text=f"{status} {type_emoji} {channel[:20]}", callback_data=f"forced_remove_{ch_id}")
+    builder.adjust(1)
+    if page > 0:
+        builder.row(InlineKeyboardButton(text="⬅️", callback_data=f"forced_page_{page-1}"))
+    if start+per_page < len(channels):
+        builder.row(InlineKeyboardButton(text="➡️", callback_data=f"forced_page_{page+1}"))
+    builder.row(InlineKeyboardButton(text="🔙 Orqaga", callback_data="back_to_forced_menu"))
+    return builder.as_markup()
+
+def media_list_keyboard(media_type=None, page=0):
+    builder = InlineKeyboardBuilder()
+    if media_type:
+        cursor.execute("SELECT id, name, code FROM media WHERE type = ? ORDER BY name", (media_type,))
+    else:
+        cursor.execute("SELECT id, name, code FROM media ORDER BY name")
+    media_list = cursor.fetchall()
+    per_page = 10
+    start = page * per_page
+    for media_id, name, code in media_list[start:start+per_page]:
+        builder.button(text=f"{name} [{code}]", callback_data=f"select_media_{media_id}")
+    builder.adjust(1)
+    if page > 0:
+        builder.row(InlineKeyboardButton(text="⬅️", callback_data=f"media_page_{page-1}_{media_type or ''}"))
+    if start+per_page < len(media_list):
+        builder.row(InlineKeyboardButton(text="➡️", callback_data=f"media_page_{page+1}_{media_type or ''}"))
+    builder.row(InlineKeyboardButton(text="🔙 Orqaga", callback_data="back_to_admin_reply"))
+    return builder.as_markup()
+
+def parts_list_keyboard(media_id, page=0):
+    builder = InlineKeyboardBuilder()
+    cursor.execute("SELECT part_number, id FROM parts WHERE media_id = ? ORDER BY part_number", (media_id,))
+    parts = cursor.fetchall()
+    per_page = 20
+    start = page * per_page
+    for part_num, part_id in parts[start:start+per_page]:
+        builder.button(text=f"📹 {part_num}-qism", callback_data=f"select_part_{part_id}")
+    builder.adjust(2)
+    if page > 0:
+        builder.row(InlineKeyboardButton(text="⬅️", callback_data=f"parts_page_{media_id}_{page-1}"))
+    if start+per_page < len(parts):
+        builder.row(InlineKeyboardButton(text="➡️", callback_data=f"parts_page_{media_id}_{page+1}"))
+    builder.row(InlineKeyboardButton(text="🔙 Orqaga", callback_data=f"back_to_media_{media_id}"))
+    return builder.as_markup()
+
+def watch_parts_keyboard(media_id, page=0):
+    builder = InlineKeyboardBuilder()
+    cursor.execute("SELECT part_number FROM parts WHERE media_id = ? ORDER BY part_number", (media_id,))
+    parts = cursor.fetchall()
+    per_page = 10
+    start = page * per_page
+    for part_num in parts[start:start+per_page]:
+        builder.button(text=f"{part_num[0]}", callback_data=f"watch_part_{media_id}_{part_num[0]}")
+    builder.adjust(5)
+    if page > 0:
+        builder.row(InlineKeyboardButton(text="⬅️", callback_data=f"watch_parts_page_{media_id}_{page-1}"))
+    if start+per_page < len(parts):
+        builder.row(InlineKeyboardButton(text="➡️", callback_data=f"watch_parts_page_{media_id}_{page+1}"))
+    builder.row(InlineKeyboardButton(text="⭐ Reyting", callback_data=f"rate_media_{media_id}"))
+    builder.row(InlineKeyboardButton(text="🔙 Ortga", callback_data=f"view_media_{media_id}"))
+    return builder.as_markup()
+
+def edit_media_fields_keyboard(media_id):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📝 Nomi", callback_data=f"edit_media_{media_id}_name")],
+        [InlineKeyboardButton(text="🔢 Kod", callback_data=f"edit_media_{media_id}_code")],
+        [InlineKeyboardButton(text="📄 Tavsif", callback_data=f"edit_media_{media_id}_description")],
+        [InlineKeyboardButton(text="🖼 Rasm", callback_data=f"edit_media_{media_id}_image")],
+        [InlineKeyboardButton(text="🎭 Janr", callback_data=f"edit_media_{media_id}_genre")],
+        [InlineKeyboardButton(text="📊 Holat", callback_data=f"edit_media_{media_id}_status")],
+        [InlineKeyboardButton(text="🎬 Sezon", callback_data=f"edit_media_{media_id}_season")],
+        [InlineKeyboardButton(text="🎙 Ovoz", callback_data=f"edit_media_{media_id}_voice")],
+        [InlineKeyboardButton(text="🤝 Himoy", callback_data=f"edit_media_{media_id}_sponsor")],
+        [InlineKeyboardButton(text="📀 Sifat", callback_data=f"edit_media_{media_id}_quality")],
+        [InlineKeyboardButton(text="🔙 Orqaga", callback_data=f"back_to_media_{media_id}")]
+    ])
+
+def edit_part_fields_keyboard(part_id, media_id):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📹 Video", callback_data=f"edit_part_{part_id}_video")],
+        [InlineKeyboardButton(text="📝 Caption", callback_data=f"edit_part_{part_id}_caption")],
+        [InlineKeyboardButton(text="🔢 Qism raqami", callback_data=f"edit_part_{part_id}_number")],
+        [InlineKeyboardButton(text="🔙 Orqaga", callback_data=f"back_to_parts_{media_id}")]
+    ])
+
+def status_keyboard(media_id):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🟢 Davom etmoqda", callback_data=f"set_status_{media_id}_ongoing")],
+        [InlineKeyboardButton(text="✅ Tugallangan", callback_data=f"set_status_{media_id}_completed")],
+        [InlineKeyboardButton(text="⏸ To'xtatilgan", callback_data=f"set_status_{media_id}_hiatus")],
+        [InlineKeyboardButton(text="🔙 Orqaga", callback_data=f"back_to_media_{media_id}")]
+    ])
+
+def rating_keyboard(media_id):
+    builder = InlineKeyboardBuilder()
+    for i in range(1, 11):
+        builder.button(text=f"{i}⭐", callback_data=f"rating_{media_id}_{i}")
+    builder.adjust(5)
+    builder.row(InlineKeyboardButton(text="🔙 Orqaga", callback_data=f"watch_parts_{media_id}"))
+    return builder.as_markup()
+
+# ========== YORDAMCHI FUNKSIYALAR ==========
+def is_admin(user_id):
+    cursor.execute("SELECT 1 FROM admins WHERE user_id = ?", (user_id,))
+    return cursor.fetchone() is not None
+
+def is_owner(user_id):
+    return user_id in OWNERS
+
+async def add_user(user):
+    cursor.execute("INSERT OR IGNORE INTO users (id, username, first_name, last_name, registered_at, last_active) VALUES (?, ?, ?, ?, ?, ?)",
+                   (user.id, user.username, user.first_name, user.last_name, datetime.now().isoformat(), datetime.now().isoformat()))
+    conn.commit()
+
+async def update_user_activity(user_id):
+    cursor.execute("UPDATE users SET last_active = ? WHERE id = ?", (datetime.now().isoformat(), user_id))
+    conn.commit()
+
+def get_media_rating(media_id):
+    cursor.execute("SELECT AVG(rating), COUNT(*) FROM ratings WHERE media_id = ?", (media_id,))
+    avg, count = cursor.fetchone()
+    if avg is None:
+        return 0.0, 0
+    return round(avg, 1), count
+
+def format_media_post(media):
+    """Media ma'lumotlarini chiroyli formatda chiqarish"""
+    name, media_type, genre, status, season, total_parts, views, code, voice, sponsor, quality, rating, rating_count = media
+    
+    status_text = {"ongoing": "🟢 Davom etmoqda", "completed": "✅ Tugallangan", "hiatus": "⏸ To'xtatilgan"}.get(status, "❓")
+    voice_text = voice if voice else f"{AUTHOR_USERNAME}"
+    sponsor_text = sponsor if sponsor else "Animedia FUN DUB"
+    
+    # Janrlarni # bilan formatlash
+    genre_list = [f"#{g.strip().capitalize()}" for g in genre.split(",")] if genre else []
+    genre_text = " ".join(genre_list) if genre_list else "Noma'lum"
+    
+    post = f"""✽───〔•°⛩°•〕───✽
+🏷 Anime nomi : {name}
+. . . . . . . . . . . . . . . . . . . . . . . ──
+🖋 Janri : {genre_text}
+. . . ── . . . . . . . . . . . . . . . . . . . .
+🎞 Qismlar soni : {total_parts}
+. . . . . . . . . . . . . . . . . . . . . . . ──
+📊 Holati : {status_text}
+. . . ── . . . . . . . . . . . . . . . . . . . .
+🎙 Ovoz berdi : {voice_text}
+. . . ── . . . . . . . . . . . . . . . . . . . .
+💿 Sifat : {quality}
+. . . ── . . . . . . . . . . . . . . . . . . . .
+💭 Tili : O'zbek tilida
+. . . ── . . . . . . . . . . . . . . . . . . . .
+⭐️ Reyting : {rating}/10 ({rating_count} ta baho)
+✽───〔•°⛩°•〕───✽
+
+🔢 Kod : {code}
+👁 Ko'rilgan : {views} marta
+📢 Kanal : {MAIN_CHANNEL}
+"""
+    return post
+
+def format_part_post(media_name, part_num, code):
+    """Qism postini chiroyli formatda chiqarish"""
+    return f"""✽───〔•°⛩°•〕───✽
+🏷 Anime nomi : {media_name}
+└─🎬 {part_num}-qism
+✽───〔•°⛩°•〕───✽
+
+🔢 Kod : {code}
+📢 Kanal : {MAIN_CHANNEL}
+"""
+
+# ========== MAJBURIY A'ZOLIK ==========
+async def check_subscription(user_id):
+    """Foydalanuvchi majburiy kanallarga a'zoligini tekshirish"""
+    cursor.execute("SELECT channel_username, channel_type FROM forced_channels WHERE is_active = 1")
+    channels = cursor.fetchall()
+    if not channels:
+        return True, []
+    
+    not_subscribed = []
+    for channel_username, channel_type in channels:
+        if channel_type == "telegram":
+            clean_channel = channel_username.replace('@', '').strip()
+            if not clean_channel:
+                continue
+            try:
+                member = await bot.get_chat_member(chat_id=f"@{clean_channel}", user_id=user_id)
+                if member.status in ['left', 'kicked']:
+                    not_subscribed.append({"type": channel_type, "username": channel_username})
+            except Exception as e:
+                print(f"⚠️ Kanal tekshirish xatosi {channel_username}: {e}")
+        else:
+            # Instagram va YouTube uchun faqat link ko'rsatiladi, tekshirilmaydi
+            # Foydalanuvchi o'zi a'zo bo'lishi kerak
+            not_subscribed.append({"type": channel_type, "username": channel_username})
+    
+    return len(not_subscribed) == 0, not_subscribed
+
+async def get_subscription_keyboard():
+    """Majburiy kanallar uchun tugmalar yaratish (username KO'RSATILMAYDI)"""
+    cursor.execute("SELECT channel_username, channel_type FROM forced_channels WHERE is_active = 1")
+    channels = cursor.fetchall()
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[])
+    
+    for channel_username, channel_type in channels:
+        if channel_type == "telegram":
+            clean_channel = channel_username.replace('@', '').strip()
+            if clean_channel:
+                keyboard.inline_keyboard.append([
+                    InlineKeyboardButton(text="📢 Kanalga a'zo bo'ling", url=f"https://t.me/{clean_channel}")
+                ])
+        elif channel_type == "instagram":
+            clean_channel = channel_username.replace('@', '').replace('instagram.com/', '').strip()
+            keyboard.inline_keyboard.append([
+                InlineKeyboardButton(text="📸 Instagram da kuzatib boring", url=f"https://instagram.com/{clean_channel}")
+            ])
+        elif channel_type == "youtube":
+            keyboard.inline_keyboard.append([
+                InlineKeyboardButton(text="▶️ YouTube kanaliga obuna bo'ling", url=channel_username)
+            ])
+    
+    keyboard.inline_keyboard.append([InlineKeyboardButton(text="✅ Tekshirish", callback_data="check_sub")])
+    return keyboard
+
+# ========== BOSHQA YORDAMCHI FUNKSIYALAR ==========
+async def safe_send_message(chat_id, text, **kwargs):
+    try:
+        return await bot.send_message(chat_id, text, **kwargs)
+    except:
+        return None
+
+async def safe_send_photo(chat_id, photo, caption=None, **kwargs):
+    try:
+        return await bot.send_photo(chat_id, photo, caption=caption, **kwargs)
+    except Exception as e:
+        print(f"Rasm yuborish xatosi: {e}")
+        return await safe_send_message(chat_id, caption if caption else "Rasm yuborib bo'lmadi!", **kwargs)
+
+async def safe_send_video(chat_id, video, caption=None, **kwargs):
+    try:
+        return await bot.send_video(chat_id, video, caption=caption, **kwargs)
+    except:
+        return None
+
+async def send_text_file(chat_id, text, filename):
+    try:
+        file = io.BytesIO(text.encode('utf-8'))
+        file.name = filename
+        document = BufferedInputFile(file.getvalue(), filename=filename)
+        await bot.send_document(chat_id, document)
+    except Exception as e:
+        print(f"Fayl yuborishda xatolik: {e}")
+
+# ========== MEDIA KO'RISH ==========
+async def view_media_by_id(message, media_id):
+    try:
+        cursor.execute("SELECT name, type, description, image_url, genre, status, season, total_parts, views, code, voice, sponsor, quality, rating, rating_count FROM media WHERE id = ?", (media_id,))
+        media = cursor.fetchone()
+        if not media:
+            await safe_send_message(message.chat.id, "❌ Media topilmadi!")
+            return
+        name, media_type, desc, image, genre, status, season, total_parts, views, code, voice, sponsor, quality, rating, rating_count = media
+        cursor.execute("UPDATE media SET views = views + 1 WHERE id = ?", (media_id,))
+        conn.commit()
+        
+        post = format_media_post((name, media_type, genre, status, season, total_parts, views+1, code, voice, sponsor, quality, rating, rating_count))
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📺 Tomosha qilish", callback_data=f"watch_parts_{media_id}")],
+            [InlineKeyboardButton(text="⭐ Reyting", callback_data=f"rate_media_{media_id}")],
+            [InlineKeyboardButton(text="🔙 Ortga", callback_data="back_to_start")]
+        ])
+        
+        if image and (image.startswith("http") or image.startswith("AgA")):
+            await safe_send_photo(message.chat.id, photo=image, caption=post, reply_markup=keyboard, parse_mode="HTML")
+        else:
+            await safe_send_message(message.chat.id, post, reply_markup=keyboard, parse_mode="HTML")
+    except Exception as e:
+        print(f"view_media_by_id xatosi: {e}")
+        await safe_send_message(message.chat.id, "❌ Xatolik yuz berdi!")
+
+# ========== START HANDLER ==========
+@dp.message(Command("start"))
+async def start(message: types.Message):
+    await add_user(message.from_user)
+    
+    is_subscribed, not_subscribed = await check_subscription(message.from_user.id)
+    
+    if not is_subscribed and not_subscribed:
+        text = "❌ Botdan foydalanish uchun quyidagi manbalarga a'zo bo'ling:\n\n"
+        for ch in not_subscribed:
+            if ch["type"] == "telegram":
+                text += f"📢 Telegram kanal\n"
+            elif ch["type"] == "instagram":
+                text += f"📸 Instagram\n"
+            elif ch["type"] == "youtube":
+                text += f"▶️ YouTube\n"
+        keyboard = await get_subscription_keyboard()
+        await safe_send_message(message.chat.id, text, reply_markup=keyboard, parse_mode="HTML")
+        return
+    
+    args = message.text.split()
+    if len(args) > 1 and args[1].startswith("code_"):
+        code = args[1].replace("code_", "")
+        if "&part=" in code:
+            code, part_num = code.split("&part=")
+            try:
+                code_int = int(code)
+                part_num_int = int(part_num)
+                cursor.execute("SELECT id FROM media WHERE code = ?", (code_int,))
+                media = cursor.fetchone()
+                if media:
+                    cursor.execute("SELECT file_id, caption FROM parts WHERE media_id = ? AND part_number = ?", (media[0], part_num_int))
+                    part = cursor.fetchone()
+                    if part:
+                        cursor.execute("SELECT name FROM media WHERE id = ?", (media[0],))
+                        media_name = cursor.fetchone()[0]
+                        full_caption = format_part_post(media_name, part_num_int, code_int)
+                        await safe_send_video(message.chat.id, video=part[0], caption=full_caption, parse_mode="HTML")
+                        return
+            except:
+                pass
+        else:
+            try:
+                code_int = int(code)
+                cursor.execute("SELECT id FROM media WHERE code = ?", (code_int,))
+                media = cursor.fetchone()
+                if media:
+                    await view_media_by_id(message, media[0])
+                    return
+            except:
+                pass
+    
+    start_image = get_start_image()
+    welcome_text = (
+        "🎬 <b>Animedia FUN DUB Rasmiy Bot</b> 🎬\n\n"
+        "✨ <b>Botimizga xush kelibsiz!</b> ✨\n\n"
+        "📚 <b>Bot imkoniyatlari:</b>\n"
+        "🔍 Kod orqali qidiruv\n"
+        "🎬 Anime va dramalarni nom bilan qidirish\n"
+        "⭐ Reyting berish\n"
+        "📺 Barcha qismlarni tomosha qilish\n\n"
+        f"📢 <b>Asosiy kanal:</b> {MAIN_CHANNEL}\n"
+        f"👨‍💻 <b>Muallif:</b> <a href='{AUTHOR_LINK}'>{AUTHOR_USERNAME}</a>\n"
+        f"🆘 <b>Yordam:</b> <a href='{SUPPORT_LINK}'>{SUPPORT_USERNAME}</a>\n\n"
+        "⬇️ <b>Quyidagi tugmalardan birini tanlang:</b> ⬇️"
+    )
+    if start_image:
+        await safe_send_photo(message.chat.id, photo=start_image, caption=welcome_text, reply_markup=start_menu(), parse_mode="HTML")
+    else:
+        await safe_send_message(message.chat.id, welcome_text, reply_markup=start_menu(), parse_mode="HTML")
+
+@dp.callback_query(F.data == "check_sub")
+async def check_subscription_callback(callback: CallbackQuery):
+    is_subscribed, not_subscribed = await check_subscription(callback.from_user.id)
+    
+    if is_subscribed:
+        try:
+            await callback.message.delete()
+        except:
+            pass
+        start_image = get_start_image()
+        welcome_text = (
+            "🎬 <b>Animedia FUN DUB Rasmiy Bot</b> 🎬\n\n"
+            "✨ <b>Botimizga xush kelibsiz!</b> ✨\n\n"
+            "📚 <b>Bot imkoniyatlari:</b>\n"
+            "🔍 Kod orqali qidiruv\n"
+            "🎬 Anime va dramalarni nom bilan qidirish\n"
+            "⭐ Reyting berish\n"
+            "📺 Barcha qismlarni tomosha qilish\n\n"
+            f"📢 <b>Asosiy kanal:</b> {MAIN_CHANNEL}\n"
+            f"👨‍💻 <b>Muallif:</b> <a href='{AUTHOR_LINK}'>{AUTHOR_USERNAME}</a>\n"
+            f"🆘 <b>Yordam:</b> <a href='{SUPPORT_LINK}'>{SUPPORT_USERNAME}</a>\n\n"
+            "⬇️ <b>Quyidagi tugmalardan birini tanlang:</b> ⬇️"
+        )
+        if start_image:
+            await safe_send_photo(callback.from_user.id, photo=start_image, caption=welcome_text, reply_markup=start_menu(), parse_mode="HTML")
+        else:
+            await safe_send_message(callback.from_user.id, welcome_text, reply_markup=start_menu(), parse_mode="HTML")
+    else:
+        if not_subscribed:
+            text = "❌ Hali ham quyidagi manbalarga a'zo emassiz:\n\n"
+            for ch in not_subscribed:
+                if ch["type"] == "telegram":
+                    text += f"📢 Telegram kanal\n"
+                elif ch["type"] == "instagram":
+                    text += f"📸 Instagram\n"
+                elif ch["type"] == "youtube":
+                    text += f"▶️ YouTube\n"
+            keyboard = await get_subscription_keyboard()
+            try:
+                await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
+            except Exception as e:
+                if "message is not modified" in str(e):
+                    await callback.message.delete()
+                    await safe_send_message(callback.from_user.id, text, reply_markup=keyboard, parse_mode="HTML")
+                else:
+                    await callback.answer("Xatolik yuz berdi!", show_alert=True)
+
+# ========== START MENYUSI FUNKSIYALARI ==========
+@dp.callback_query(F.data == "search_by_code")
+async def search_by_code_start(callback: CallbackQuery, state: FSMContext):
+    await update_user_activity(callback.from_user.id)
+    await state.set_state(CodeSearchState.waiting_for_code)
+    text = "🔍 Qidirilishi kerak bo'lgan anime yoki drama kodini yuboring"
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Orqaga", callback_data="back_to_start")]])
+    try:
+        await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
+    except:
+        await safe_send_message(callback.from_user.id, text, reply_markup=keyboard, parse_mode="HTML")
+    await callback.answer()
+
+@dp.callback_query(F.data == "search_anime")
+async def search_anime_start(callback: CallbackQuery, state: FSMContext):
+    await update_user_activity(callback.from_user.id)
+    await state.update_data(search_type="anime")
+    await state.set_state(SearchState.query)
+    text = "🔍 Qidirilishi kerak bo'lgan anime nomini yuboring"
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Orqaga", callback_data="back_to_start")]])
+    try:
+        await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
+    except:
+        await safe_send_message(callback.from_user.id, text, reply_markup=keyboard, parse_mode="HTML")
+    await callback.answer()
+
+@dp.callback_query(F.data == "search_drama")
+async def search_drama_start(callback: CallbackQuery, state: FSMContext):
+    await update_user_activity(callback.from_user.id)
+    await state.update_data(search_type="drama")
+    await state.set_state(SearchState.query)
+    text = "🔍 Qidirilishi kerak bo'lgan drama nomini yuboring"
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Orqaga", callback_data="back_to_start")]])
+    try:
+        await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
+    except:
+        await safe_send_message(callback.from_user.id, text, reply_markup=keyboard, parse_mode="HTML")
+    await callback.answer()
+
+@dp.callback_query(F.data == "guide")
+async def guide_start(callback: CallbackQuery):
+    await update_user_activity(callback.from_user.id)
+    text = (
+        "📚 Botni ishlatish bo'yicha qo'llanma:\n\n"
+        "🔍 Kod orqali qidiruv - Anime kodini yuborib topish\n"
+        "🎬 Anime Qidirish - Botda mavjud bo'lgan animelarni qidirish\n"
+        "🎭 Drama Qidirish - Botda mavjud bo'lgan dramalarni qidirish\n"
+        "⭐ Reyting berish - Animelarga 1-10 gacha baho berish\n"
+        "📓 Ro'yxat - Botga joylangan Anime va Dramalar ro'yxati\n\n"
+        f"👨‍💻 Muallif: <a href='{AUTHOR_LINK}'>{AUTHOR_USERNAME}</a>\n"
+        f"🆘 Yordam: <a href='{SUPPORT_LINK}'>{SUPPORT_USERNAME}</a>\n\n"
+        f"🆔 Botdagi ID ingiz: {callback.from_user.id}"
+    )
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Orqaga", callback_data="back_to_start")]])
+    try:
+        await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
+    except:
+        await safe_send_message(callback.from_user.id, text, reply_markup=keyboard, parse_mode="HTML")
+    await callback.answer()
+
+@dp.callback_query(F.data == "list_all")
+async def list_all_start(callback: CallbackQuery):
+    await update_user_activity(callback.from_user.id)
+    
+    anime_list = cursor.execute("SELECT name, code, total_parts, status FROM media WHERE type = 'anime' ORDER BY name").fetchall()
+    drama_list = cursor.execute("SELECT name, code, total_parts, status FROM media WHERE type = 'drama' ORDER BY name").fetchall()
+    
+    if anime_list:
+        anime_text = "🎬 ANIMELAR RO'YXATI\n\n"
+        for i, (name, code, parts, status) in enumerate(anime_list, 1):
+            status_emoji = "🟢" if status == "ongoing" else "✅" if status == "completed" else "⏸"
+            anime_text += f"{i}. {name}\n   Kod: {code} | Qism: {parts} | {status_emoji}\n\n"
+        await send_text_file(callback.from_user.id, anime_text, "Animelar_Royxati.txt")
+    
+    if drama_list:
+        drama_text = "🎭 DRAMALAR RO'YXATI\n\n"
+        for i, (name, code, parts, status) in enumerate(drama_list, 1):
+            status_emoji = "🟢" if status == "ongoing" else "✅" if status == "completed" else "⏸"
+            drama_text += f"{i}. {name}\n   Kod: {code} | Qism: {parts} | {status_emoji}\n\n"
+        await send_text_file(callback.from_user.id, drama_text, "Dramalar_Royxati.txt")
+    
+    if not anime_list and not drama_list:
+        try:
+            await callback.message.edit_text("📭 Hozircha media mavjud emas!", parse_mode="HTML")
+        except:
+            await safe_send_message(callback.from_user.id, "📭 Hozircha media mavjud emas!", parse_mode="HTML")
+    
+    await callback.answer()
+
+@dp.callback_query(F.data == "rate_anime")
+async def rate_anime_list(callback: CallbackQuery, state: FSMContext):
+    await update_user_activity(callback.from_user.id)
+    await state.set_state(RatingState.waiting_for_rating)
+    
+    # Barcha animelarni ko'rsatish
+    builder = InlineKeyboardBuilder()
+    cursor.execute("SELECT id, name, code FROM media WHERE type = 'anime' ORDER BY name")
+    anime_list = cursor.fetchall()
+    
+    if not anime_list:
+        await callback.answer("Hozircha anime mavjud emas!", show_alert=True)
+        return
+    
+    for media_id, name, code in anime_list[:30]:
+        builder.button(text=f"{name} [{code}]", callback_data=f"rate_select_{media_id}")
+    builder.adjust(1)
+    builder.row(InlineKeyboardButton(text="🔙 Orqaga", callback_data="back_to_start"))
+    
+    await callback.message.edit_text("⭐ Reyting bermoqchi bo'lgan animeni tanlang:", reply_markup=builder.as_markup())
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("rate_select_"))
+async def rate_select_media(callback: CallbackQuery, state: FSMContext):
+    media_id = int(callback.data.split("_")[2])
+    cursor.execute("SELECT name FROM media WHERE id = ?", (media_id,))
+    media_name = cursor.fetchone()[0]
+    await state.update_data(rate_media_id=media_id)
+    await callback.message.edit_text(
+        f"⭐ <b>{media_name}</b> ga qancha baho berasiz?\n\n1⭐ - 10⭐ gacha tanlang:",
+        reply_markup=rating_keyboard(media_id),
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("rating_"))
+async def set_rating(callback: CallbackQuery, state: FSMContext):
+    parts = callback.data.split("_")
+    media_id = int(parts[1])
+    rating = int(parts[2])
+    user_id = callback.from_user.id
+    
+    # Avvalgi bahoni tekshirish
+    cursor.execute("SELECT id FROM ratings WHERE user_id = ? AND media_id = ?", (user_id, media_id))
+    existing = cursor.fetchone()
+    
+    if existing:
+        cursor.execute("UPDATE ratings SET rating = ?, created_at = ? WHERE user_id = ? AND media_id = ?",
+                       (rating, datetime.now().isoformat(), user_id, media_id))
+    else:
+        cursor.execute("INSERT INTO ratings (user_id, media_id, rating, created_at) VALUES (?, ?, ?, ?)",
+                       (user_id, media_id, rating, datetime.now().isoformat()))
+    
+    # Media jadvalidagi o'rtacha reytingni yangilash
+    avg_rating, count = get_media_rating(media_id)
+    cursor.execute("UPDATE media SET rating = ?, rating_count = ? WHERE id = ?", (avg_rating, count, media_id))
+    conn.commit()
+    
+    cursor.execute("SELECT name FROM media WHERE id = ?", (media_id,))
+    media_name = cursor.fetchone()[0]
+    
+    await callback.message.edit_text(f"✅ <b>{media_name}</b> ga {rating}⭐ baho berdingiz!\n\nReyting: {avg_rating}/10 ({count} ta baho)", parse_mode="HTML")
+    await state.clear()
+    await callback.answer()
+
+@dp.callback_query(F.data == "back_to_start")
+async def back_to_start(callback: CallbackQuery):
+    start_image = get_start_image()
+    welcome_text = (
+        "🎬 <b>Animedia FUN DUB Rasmiy Bot</b> 🎬\n\n"
+        "✨ <b>Botimizga xush kelibsiz!</b> ✨\n\n"
+        "📚 <b>Bot imkoniyatlari:</b>\n"
+        "🔍 Kod orqali qidiruv\n"
+        "🎬 Anime va dramalarni nom bilan qidirish\n"
+        "⭐ Reyting berish\n"
+        "📺 Barcha qismlarni tomosha qilish\n\n"
+        f"📢 <b>Asosiy kanal:</b> {MAIN_CHANNEL}\n"
+        f"👨‍💻 <b>Muallif:</b> <a href='{AUTHOR_LINK}'>{AUTHOR_USERNAME}</a>\n"
+        f"🆘 <b>Yordam:</b> <a href='{SUPPORT_LINK}'>{SUPPORT_USERNAME}</a>\n\n"
+        "⬇️ <b>Quyidagi tugmalardan birini tanlang:</b> ⬇️"
+    )
+    try:
+        await callback.message.delete()
+    except:
+        pass
+    if start_image:
+        await safe_send_photo(callback.from_user.id, photo=start_image, caption=welcome_text, reply_markup=start_menu(), parse_mode="HTML")
+    else:
+        await safe_send_message(callback.from_user.id, welcome_text, reply_markup=start_menu(), parse_mode="HTML")
+    await callback.answer()
+
+# ========== KOD ORQALI QIDIRUV ==========
+@dp.message(CodeSearchState.waiting_for_code)
+async def search_by_code(message: types.Message, state: FSMContext):
+    await update_user_activity(message.from_user.id)
+    text = message.text.strip()
+    
+    if not text.isdigit():
+        await message.answer("❌ Iltimos, faqat raqam (kod) yuboring!")
+        return
+    
+    code = int(text)
+    cursor.execute("SELECT id FROM media WHERE code = ?", (code,))
+    media = cursor.fetchone()
+    
+    if media:
+        await view_media_by_id(message, media[0])
+    else:
+        await message.answer(f"❌ '{code}' kodli media topilmadi!")
+    
+    await state.clear()
+
+# ========== NOM BO'YICHA QIDIRUV ==========
+@dp.message(SearchState.query)
+async def search_media_query(message: types.Message, state: FSMContext):
+    query = message.text.strip()
+    data = await state.get_data()
+    search_type = data.get('search_type', 'anime')
+    media_type = "anime" if search_type == "anime" else "drama"
+    
+    cursor.execute("SELECT id, name, type, total_parts, status, code FROM media WHERE type = ? AND name LIKE ? ORDER BY name", (media_type, f"%{query}%"))
+    results = cursor.fetchall()
+    
+    if not results:
+        await safe_send_message(message.chat.id, f"❌ '{query}' bo'yicha hech narsa topilmadi!")
+        await state.clear()
+        return
+    
+    builder = InlineKeyboardBuilder()
+    for media_id, name, m_type, parts, status, code in results:
+        status_emoji = "🟢" if status == "ongoing" else "✅" if status == "completed" else "⏸"
+        builder.button(text=f"{'🎬' if m_type=='anime' else '🎭'} {name} [{code}] {status_emoji} ({parts} qism)", callback_data=f"view_media_{media_id}")
+    builder.adjust(1)
+    builder.row(InlineKeyboardButton(text="🔙 Orqaga", callback_data="back_to_start"))
+    
+    await safe_send_message(message.chat.id, f"🔍 '{query}' bo'yicha topilganlar ({len(results)}):", reply_markup=builder.as_markup())
+    await state.clear()
+
+# ========== MEDIA KO'RISH ==========
+@dp.callback_query(lambda c: c.data.startswith("view_media_"))
+async def view_media(callback: CallbackQuery):
+    try:
+        parts = callback.data.split("_")
+        media_id = int(parts[2])
+        cursor.execute("SELECT name, type, description, image_url, genre, status, season, total_parts, views, code, voice, sponsor, quality, rating, rating_count FROM media WHERE id = ?", (media_id,))
+        media = cursor.fetchone()
+        if not media:
+            await callback.answer("Media topilmadi!")
+            return
+        name, media_type, desc, image, genre, status, season, total_parts, views, code, voice, sponsor, quality, rating, rating_count = media
+        cursor.execute("UPDATE media SET views = views + 1 WHERE id = ?", (media_id,))
+        conn.commit()
+        
+        post = format_media_post((name, media_type, genre, status, season, total_parts, views+1, code, voice, sponsor, quality, rating, rating_count))
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📺 Tomosha qilish", callback_data=f"watch_parts_{media_id}")],
+            [InlineKeyboardButton(text="⭐ Reyting", callback_data=f"rate_media_{media_id}")],
+            [InlineKeyboardButton(text="🔙 Ortga", callback_data="back_to_start")]
+        ])
+        
+        if image and (image.startswith("http") or image.startswith("AgA")):
+            await safe_send_photo(callback.from_user.id, photo=image, caption=post, reply_markup=keyboard, parse_mode="HTML")
+        else:
+            await safe_send_message(callback.from_user.id, post, reply_markup=keyboard, parse_mode="HTML")
+        try:
+            await callback.message.delete()
+        except:
+            pass
+        await callback.answer()
+    except Exception as e:
+        print(f"view_media xatosi: {e}")
+        await callback.answer("Xatolik yuz berdi!")
+
+@dp.callback_query(F.data.startswith("rate_media_"))
+async def rate_media(callback: CallbackQuery):
+    media_id = int(callback.data.split("_")[2])
+    cursor.execute("SELECT name FROM media WHERE id = ?", (media_id,))
+    media_name = cursor.fetchone()[0]
+    await callback.message.edit_text(
+        f"⭐ <b>{media_name}</b> ga qancha baho berasiz?\n\n1⭐ - 10⭐ gacha tanlang:",
+        reply_markup=rating_keyboard(media_id),
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+# ========== QISMLARNI KO'RISH ==========
+@dp.callback_query(lambda c: c.data.startswith("watch_parts_") and not c.data.startswith("watch_parts_page_"))
+async def watch_parts(callback: CallbackQuery):
+    try:
+        media_id = int(callback.data.split("_")[2])
+        cursor.execute("SELECT name FROM media WHERE id = ?", (media_id,))
+        media_name = cursor.fetchone()[0]
+        cursor.execute("SELECT part_number FROM parts WHERE media_id = ? ORDER BY part_number", (media_id,))
+        parts = cursor.fetchall()
+        if not parts:
+            await callback.answer("Hozircha qismlar mavjud emas!")
+            return
+        text = f"📺 <b>{media_name}</b>\n\n📹 Qismlarni tanlang:"
+        try:
+            await callback.message.edit_text(text, reply_markup=watch_parts_keyboard(media_id), parse_mode="HTML")
+        except:
+            await safe_send_message(callback.from_user.id, text, reply_markup=watch_parts_keyboard(media_id), parse_mode="HTML")
+        await callback.answer()
+    except Exception as e:
+        print(f"watch_parts xatosi: {e}")
+        await callback.answer("Xatolik yuz berdi!")
+
+# ========== QISMNI TOMOSHA QILISH ==========
+@dp.callback_query(lambda c: c.data.startswith("watch_part_"))
+async def watch_part(callback: CallbackQuery):
+    try:
+        parts = callback.data.split("_")
+        media_id = int(parts[2])
+        part_num = int(parts[3])
+        cursor.execute("SELECT file_id, caption FROM parts WHERE media_id = ? AND part_number = ?", (media_id, part_num))
+        part = cursor.fetchone()
+        if not part:
+            await callback.answer("Qism topilmadi!")
+            return
+        file_id, caption = part
+        cursor.execute("SELECT name, code FROM media WHERE id = ?", (media_id,))
+        media_name, code = cursor.fetchone()
+        full_caption = format_part_post(media_name, part_num, code)
+        await safe_send_video(callback.from_user.id, video=file_id, caption=full_caption, parse_mode="HTML")
+        await callback.answer()
+    except Exception as e:
+        print(f"watch_part xatosi: {e}")
+        await callback.answer("Xatolik yuz berdi!")
+
+# ========== QISMLAR SAHIFASI ==========
+@dp.callback_query(lambda c: c.data.startswith("watch_parts_page_"))
+async def watch_parts_page(callback: CallbackQuery):
+    try:
+        data = callback.data.split("_")
+        if len(data) >= 5:
+            media_id = int(data[3])
+            page = int(data[4])
+        else:
+            media_id = int(data[3])
+            page = 0
+        cursor.execute("SELECT name FROM media WHERE id = ?", (media_id,))
+        media_name = cursor.fetchone()[0]
+        text = f"📺 <b>{media_name}</b>\n\n📹 Qismlarni tanlang:"
+        try:
+            await callback.message.edit_text(text, reply_markup=watch_parts_keyboard(media_id, page), parse_mode="HTML")
+        except:
+            await safe_send_message(callback.from_user.id, text, reply_markup=watch_parts_keyboard(media_id, page), parse_mode="HTML")
+        await callback.answer()
+    except Exception as e:
+        print(f"watch_parts_page xatosi: {e}")
+        await callback.answer("Xatolik yuz berdi!")
+
+# ========== ADMIN PANEL ==========
+@dp.callback_query(F.data == "admin_panel")
+async def admin_panel_callback(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("❌ Siz admin emassiz!", show_alert=True)
+        return
+    admin_image = get_admin_image()
+    admin_text = (
+        "🔐 <b>Admin Panel</b> 🔐\n\n"
+        f"👑 Adminlar: {cursor.execute('SELECT COUNT(*) FROM admins').fetchone()[0]}\n"
+        f"🎬 Media: {cursor.execute('SELECT COUNT(*) FROM media').fetchone()[0]}\n"
+        f"📹 Qismlar: {cursor.execute('SELECT COUNT(*) FROM parts').fetchone()[0]}\n"
+        f"👥 Foydalanuvchilar: {cursor.execute('SELECT COUNT(*) FROM users').fetchone()[0]}\n\n"
+        "⬇️ Quyidagi tugmalardan foydalaning:"
+    )
+    try:
+        await callback.message.delete()
+    except:
+        pass
+    if admin_image:
+        await safe_send_photo(callback.from_user.id, photo=admin_image, caption=admin_text, reply_markup=admin_menu(), parse_mode="HTML")
+    else:
+        await safe_send_message(callback.from_user.id, admin_text, reply_markup=admin_menu(), parse_mode="HTML")
+    await callback.answer()
+
+@dp.message(F.text == "🔙 Asosiy menyu")
+async def back_to_main_reply(message: types.Message):
+    start_image = get_start_image()
+    welcome_text = (
+        "🎬 <b>Animedia FUN DUB Rasmiy Bot</b> 🎬\n\n"
+        "✨ <b>Botimizga xush kelibsiz!</b> ✨\n\n"
+        "📚 <b>Bot imkoniyatlari:</b>\n"
+        "🔍 Kod orqali qidiruv\n"
+        "🎬 Anime va dramalarni nom bilan qidirish\n"
+        "⭐ Reyting berish\n"
+        "📺 Barcha qismlarni tomosha qilish\n\n"
+        f"📢 <b>Asosiy kanal:</b> {MAIN_CHANNEL}\n"
+        f"👨‍💻 <b>Muallif:</b> <a href='{AUTHOR_LINK}'>{AUTHOR_USERNAME}</a>\n"
+        f"🆘 <b>Yordam:</b> <a href='{SUPPORT_LINK}'>{SUPPORT_USERNAME}</a>\n\n"
+        "⬇️ <b>Quyidagi tugmalardan birini tanlang:</b> ⬇️"
+    )
+    if start_image:
+        await safe_send_photo(message.chat.id, photo=start_image, caption=welcome_text, reply_markup=start_menu(), parse_mode="HTML")
+    else:
+        await safe_send_message(message.chat.id, welcome_text, reply_markup=start_menu(), parse_mode="HTML")
+
+@dp.callback_query(F.data == "back_to_admin_reply")
+async def back_to_admin_reply(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("❌ Ruxsat yo'q!")
+        return
+    try:
+        await callback.message.delete()
+    except:
+        pass
+    await safe_send_message(callback.from_user.id, "🔐 Admin Panel", reply_markup=admin_menu(), parse_mode="HTML")
+    await callback.answer()
+
+# ========== MEDIA QO'SHISH ==========
+@dp.message(F.text == "➕ Media Qo'shish")
+async def add_media_start(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id): return
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎬 Anime", callback_data="media_type_anime")],
+        [InlineKeyboardButton(text="🎭 Drama", callback_data="media_type_drama")],
+        [InlineKeyboardButton(text="🔙 Bekor", callback_data="cancel_add_admin")]
+    ])
+    await message.answer("Media turini tanlang:", reply_markup=keyboard)
+    await state.set_state(AddMediaState.type)
+
+@dp.callback_query(AddMediaState.type, F.data.startswith("media_type_"))
+async def add_media_type(callback: CallbackQuery, state: FSMContext):
+    media_type = callback.data.split("_")[2]
+    await state.update_data(type=media_type)
+    try:
+        await callback.message.edit_text("Media nomini kiriting:")
+    except:
+        await safe_send_message(callback.from_user.id, "Media nomini kiriting:")
+    await state.set_state(AddMediaState.name)
+    await callback.answer()
+
+@dp.message(AddMediaState.name)
+async def add_media_name(message: types.Message, state: FSMContext):
+    await state.update_data(name=message.text)
+    await message.answer("Media kodini kiriting (faqat raqam, masalan: 1, 2, 3...):")
+    await state.set_state(AddMediaState.code)
+
+@dp.message(AddMediaState.code)
+async def add_media_code(message: types.Message, state: FSMContext):
+    try:
+        code = int(message.text.strip())
+        cursor.execute("SELECT id FROM media WHERE code = ?", (code,))
+        if cursor.fetchone():
+            await message.answer(f"❌ '{code}' kodi mavjud! Boshqa kod kiriting:")
+            return
+        await state.update_data(code=code)
+        await message.answer("Media tavsifini kiriting:")
+        await state.set_state(AddMediaState.description)
+    except ValueError:
+        await message.answer("❌ Faqat raqam kiriting!")
+
+@dp.message(AddMediaState.description)
+async def add_media_description(message: types.Message, state: FSMContext):
+    await state.update_data(description=message.text)
+    await message.answer("Rasm yuboring (jpg/png) yoki URL kiriting:")
+    await state.set_state(AddMediaState.image)
+
+@dp.message(AddMediaState.image, F.photo)
+async def add_media_image_photo(message: types.Message, state: FSMContext):
+    await state.update_data(image=message.photo[-1].file_id)
+    await message.answer("Janrlarini kiriting (vergul bilan, masalan: Romance, Drama, Action):")
+    await state.set_state(AddMediaState.genre)
+
+@dp.message(AddMediaState.image, F.text)
+async def add_media_image_url(message: types.Message, state: FSMContext):
+    await state.update_data(image=message.text)
+    await message.answer("Janrlarini kiriting (vergul bilan, masalan: Romance, Drama, Action):")
+    await state.set_state(AddMediaState.genre)
+
+@dp.message(AddMediaState.genre)
+async def add_media_genre(message: types.Message, state: FSMContext):
+    await state.update_data(genre=message.text)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🟢 Davom etmoqda", callback_data="add_status_ongoing")],
+        [InlineKeyboardButton(text="✅ Tugallangan", callback_data="add_status_completed")],
+        [InlineKeyboardButton(text="⏸ To'xtatilgan", callback_data="add_status_hiatus")]
+    ])
+    await message.answer("Media holatini tanlang:", reply_markup=keyboard)
+    await state.set_state(AddMediaState.status)
+
+@dp.callback_query(AddMediaState.status, F.data.startswith("add_status_"))
+async def add_media_status(callback: CallbackQuery, state: FSMContext):
+    status = callback.data.split("_")[2]
+    await state.update_data(status=status)
+    try:
+        await callback.message.edit_text("Sezon raqamini kiriting (masalan: 1):")
+    except:
+        await safe_send_message(callback.from_user.id, "Sezon raqamini kiriting (masalan: 1):")
+    await state.set_state(AddMediaState.season)
+    await callback.answer()
+
+@dp.message(AddMediaState.season)
+async def add_media_season(message: types.Message, state: FSMContext):
+    try:
+        season = int(message.text.strip())
+        await state.update_data(season=season)
+        await message.answer("Ovoz beruvchi(lar)ni kiriting (masalan: Animedia FUN DUB):")
+        await state.set_state(AddMediaState.voice)
+    except ValueError:
+        await message.answer("❌ Faqat raqam kiriting!")
+
+@dp.message(AddMediaState.voice)
+async def add_media_voice(message: types.Message, state: FSMContext):
+    await state.update_data(voice=message.text)
+    await message.answer("Himoy (homiy) ni kiriting (masalan: Animedia):")
+    await state.set_state(AddMediaState.sponsor)
+
+@dp.message(AddMediaState.sponsor)
+async def add_media_sponsor(message: types.Message, state: FSMContext):
+    await state.update_data(sponsor=message.text)
+    await message.answer("Sifatni kiriting (masalan: 720p, 1080p):")
+    await state.set_state(AddMediaState.quality)
+
+@dp.message(AddMediaState.quality)
+async def add_media_quality(message: types.Message, state: FSMContext):
+    await state.update_data(quality=message.text)
+    data = await state.get_data()
+    try:
+        cursor.execute("INSERT INTO media (code, type, name, description, image_url, genre, status, season, voice, sponsor, quality, created_at, rating, rating_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                       (data['code'], data['type'], data['name'], data['description'], data['image'], data['genre'], data['status'], data['season'], data['voice'], data['sponsor'], data['quality'], datetime.now().isoformat(), 0.0, 0))
+        conn.commit()
+        await message.answer(f"✅ <b>{data['name']}</b> qo'shildi!\n\n🔢 Kod: <code>{data['code']}</code>", parse_mode="HTML")
+    except sqlite3.IntegrityError:
+        await message.answer("❌ Bunday nomli media mavjud!")
+    await state.clear()
+
+# ========== QISM QO'SHISH ==========
+@dp.message(F.text == "➕ Qism Qo'shish")
+async def add_part_start(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id): return
+    await message.answer("Qaysi animega qism qo'shmoqchisiz?\nAnime nomi yoki kodini kiriting:", parse_mode="HTML")
+    await state.set_state(AddPartState.select_media)
+
+@dp.message(AddPartState.select_media)
+async def add_part_select_media(message: types.Message, state: FSMContext):
+    query = message.text.strip()
+    try:
+        code = int(query)
+        cursor.execute("SELECT id, name FROM media WHERE code = ?", (code,))
+    except ValueError:
+        cursor.execute("SELECT id, name FROM media WHERE name LIKE ?", (f"%{query}%",))
+    
+    media = cursor.fetchone()
+    if not media:
+        await message.answer(f"❌ '{query}' bo'yicha media topilmadi! Qayta kiriting:")
+        return
+    
+    media_id, media_name = media
+    await state.update_data(media_id=media_id)
+    await message.answer(f"📺 <b>{media_name}</b> uchun qism raqamini kiriting:", parse_mode="HTML")
+    await state.set_state(AddPartState.part_number)
+
+@dp.message(AddPartState.part_number)
+async def add_part_number(message: types.Message, state: FSMContext):
+    try:
+        part_num = int(message.text)
+        await state.update_data(part_number=part_num)
+        data = await state.get_data()
+        cursor.execute("SELECT id FROM parts WHERE media_id = ? AND part_number = ?", (data['media_id'], part_num))
+        if cursor.fetchone():
+            await message.answer(f"⚠️ {part_num}-qism mavjud! Yangi raqam kiriting:")
+            return
+        await message.answer(f"🎬 {part_num}-qism videosini yuboring:")
+        await state.set_state(AddPartState.video)
+    except ValueError:
+        await message.answer("❌ Faqat raqam kiriting!")
+
+@dp.message(AddPartState.video, F.video)
+async def add_part_video(message: types.Message, state: FSMContext):
+    await state.update_data(video_id=message.video.file_id)
+    await message.answer("📝 Qism captioni kiriting:")
+    await state.set_state(AddPartState.caption)
+
+@dp.message(AddPartState.caption)
+async def add_part_caption(message: types.Message, state: FSMContext):
+    data = await state.update_data(caption=message.text)
+    cursor.execute("INSERT INTO parts (media_id, part_number, file_id, caption, created_at) VALUES (?, ?, ?, ?, ?)",
+                   (data['media_id'], data['part_number'], data['video_id'], data['caption'], datetime.now().isoformat()))
+    cursor.execute("UPDATE media SET total_parts = total_parts + 1 WHERE id = ?", (data['media_id'],))
+    conn.commit()
+    cursor.execute("SELECT name FROM media WHERE id = ?", (data['media_id'],))
+    media_name = cursor.fetchone()[0]
+    await message.answer(f"✅ <b>{media_name}</b> ning <b>{data['part_number']}-qismi</b> qo'shildi!", parse_mode="HTML")
+    await state.clear()
+
+# ========== KO'P QISM QO'SHISH ==========
+@dp.message(F.text == "➕ Ko'p Qism Qo'shish")
+async def add_multiple_parts_start(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id): return
+    await message.answer("Qaysi animega qism qo'shmoqchisiz?\nAnime nomi yoki kodini kiriting:", parse_mode="HTML")
+    await state.set_state(AddMultiplePartsState.select_media)
+
+@dp.message(AddMultiplePartsState.select_media)
+async def add_multiple_parts_select_media(message: types.Message, state: FSMContext):
+    query = message.text.strip()
+    try:
+        code = int(query)
+        cursor.execute("SELECT id, name FROM media WHERE code = ?", (code,))
+    except ValueError:
+        cursor.execute("SELECT id, name FROM media WHERE name LIKE ?", (f"%{query}%",))
+    
+    media = cursor.fetchone()
+    if not media:
+        await message.answer(f"❌ '{query}' bo'yicha media topilmadi! Qayta kiriting:")
+        return
+    
+    media_id, media_name = media
+    await state.update_data(media_id=media_id)
+    await message.answer(
+        f"📺 <b>{media_name}</b> uchun qismlarni yuboring!\n\n"
+        "⚠️ QO'LLANMA:\n"
+        "Videolarni tagiga son qo'yib yuboring. Bot tartib bilan qabul qiladi.\n"
+        "Masalan: 1-qism videosiga captionga 1 yozing\n\n"
+        "Tugatish uchun /done",
+        parse_mode="HTML"
+    )
+    await state.update_data(videos=[])
+    await state.set_state(AddMultiplePartsState.videos)
+
+@dp.message(AddMultiplePartsState.videos, F.video)
+async def add_multiple_parts_video(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    videos = data.get('videos', [])
+    caption = message.caption or ""
+    match = re.search(r'^(\d+)', caption)
+    part_number = int(match.group(1)) if match else (max([v.get('part_number', 0) for v in videos]) + 1 if videos else 1)
+    videos.append({'part_number': part_number, 'file_id': message.video.file_id, 'caption': caption})
+    await state.update_data(videos=videos)
+    await message.answer(f"✅ {part_number}-qism qabul qilindi! ({len(videos)} ta qism saqlandi)\nTugatish uchun /done", parse_mode="HTML")
+
+@dp.message(AddMultiplePartsState.videos, Command("done"))
+async def add_multiple_parts_done(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    media_id = data['media_id']
+    videos = data.get('videos', [])
+    if not videos:
+        await message.answer("❌ Hech qanday video yuborilmagan!")
+        return
+    videos.sort(key=lambda x: x['part_number'])
+    saved = 0
+    for video in videos:
+        cursor.execute("SELECT id FROM parts WHERE media_id = ? AND part_number = ?", (media_id, video['part_number']))
+        if not cursor.fetchone():
+            cursor.execute("INSERT INTO parts (media_id, part_number, file_id, caption, created_at) VALUES (?, ?, ?, ?, ?)",
+                           (media_id, video['part_number'], video['file_id'], video['caption'], datetime.now().isoformat()))
+            try:
+                await bot.send_video(BASE_CHANNEL_ID, video=video['file_id'], caption=f"{video['part_number']}-qism")
+            except:
+                pass
+            saved += 1
+    if saved > 0:
+        cursor.execute("UPDATE media SET total_parts = total_parts + ? WHERE id = ?", (saved, media_id))
+        conn.commit()
+    await message.answer(f"✅ {saved} ta qism qo'shildi va bazaga yuborildi!", parse_mode="HTML")
+    await state.clear()
+
+# ========== MEDIA TAHRIRLASH ==========
+@dp.message(F.text == "✏️ Media Tahrirlash")
+async def edit_media_start(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id): return
+    await message.answer("Qaysi animeni tahrirlamoqchisiz?\nAnime nomi yoki kodini kiriting:", parse_mode="HTML")
+    await state.set_state(EditMediaState.select)
+
+@dp.message(EditMediaState.select)
+async def edit_media_select(message: types.Message, state: FSMContext):
+    query = message.text.strip()
+    try:
+        code = int(query)
+        cursor.execute("SELECT id, name FROM media WHERE code = ?", (code,))
+    except ValueError:
+        cursor.execute("SELECT id, name FROM media WHERE name LIKE ?", (f"%{query}%",))
+    
+    media = cursor.fetchone()
+    if not media:
+        await message.answer(f"❌ '{query}' bo'yicha media topilmadi! Qayta kiriting:")
+        return
+    
+    media_id, media_name = media
+    await state.update_data(media_id=media_id)
+    await message.answer(f"✏️ <b>{media_name}</b> tahrirlash\n\nQaysi maydonni tahrirlamoqchisiz?", reply_markup=edit_media_fields_keyboard(media_id), parse_mode="HTML")
+    await state.set_state(EditMediaState.field)
+
+@dp.callback_query(F.data.startswith("edit_media_"))
+async def edit_media_field(callback: CallbackQuery, state: FSMContext):
+    parts = callback.data.split("_")
+    media_id = int(parts[2])
+    field = parts[3]
+    await state.update_data(media_id=media_id, field=field)
+    
+    field_names = {
+        "name": "yangi nomini",
+        "code": "yangi kodni (faqat raqam)",
+        "description": "yangi tavsifini",
+        "image": "yangi rasmni",
+        "genre": "yangi janrlarini",
+        "status": "yangi holatini",
+        "season": "yangi sezon raqamini",
+        "voice": "yangi ovoz(lar)ni",
+        "sponsor": "yangi himoy (homiy) ni",
+        "quality": "yangi sifatni"
+    }
+    
+    if field == "status":
+        try:
+            await callback.message.edit_text("Yangi holatni tanlang:", reply_markup=status_keyboard(media_id))
+        except:
+            await safe_send_message(callback.from_user.id, "Yangi holatni tanlang:", reply_markup=status_keyboard(media_id))
+        await callback.answer()
+        return
+    
+    try:
+        await callback.message.edit_text(f"✏️ {field_names.get(field, 'yangi qiymatini')} kiriting:")
+    except:
+        await safe_send_message(callback.from_user.id, f"✏️ {field_names.get(field, 'yangi qiymatini')} kiriting:")
+    await state.set_state(EditMediaState.value)
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("set_status_"))
+async def set_media_status(callback: CallbackQuery, state: FSMContext):
+    _, media_id, status = callback.data.split("_")
+    cursor.execute("UPDATE media SET status = ? WHERE id = ?", (status, int(media_id)))
+    conn.commit()
+    try:
+        await callback.message.edit_text(f"✅ Holat '{status}' ga o'zgartirildi!")
+    except:
+        await safe_send_message(callback.from_user.id, f"✅ Holat '{status}' ga o'zgartirildi!")
+    await state.clear()
+    await callback.answer()
+
+@dp.message(EditMediaState.value, F.text)
+async def edit_media_value(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    media_id = data['media_id']
+    field = data['field']
+    value = message.text
+    
+    if field == "name":
+        try:
+            cursor.execute("UPDATE media SET name = ? WHERE id = ?", (value, media_id))
+            conn.commit()
+            await message.answer(f"✅ Nomi '{value}' ga o'zgartirildi!")
+        except:
+            await message.answer("❌ Bunday nomli media mavjud!")
+    elif field == "code":
+        try:
+            code = int(value)
+            cursor.execute("SELECT id FROM media WHERE code = ? AND id != ?", (code, media_id))
+            if cursor.fetchone():
+                await message.answer("❌ Bunday kod mavjud!")
+            else:
+                cursor.execute("UPDATE media SET code = ? WHERE id = ?", (code, media_id))
+                conn.commit()
+                await message.answer(f"✅ Kod '{code}' ga o'zgartirildi!")
+        except ValueError:
+            await message.answer("❌ Faqat raqam kiriting!")
+    elif field == "description":
+        cursor.execute("UPDATE media SET description = ? WHERE id = ?", (value, media_id))
+        conn.commit()
+        await message.answer("✅ Tavsif o'zgartirildi!")
+    elif field == "genre":
+        cursor.execute("UPDATE media SET genre = ? WHERE id = ?", (value, media_id))
+        conn.commit()
+        await message.answer("✅ Janr o'zgartirildi!")
+    elif field == "season":
+        try:
+            season = int(value)
+            cursor.execute("UPDATE media SET season = ? WHERE id = ?", (season, media_id))
+            conn.commit()
+            await message.answer(f"✅ Sezon {season} ga o'zgartirildi!")
+        except ValueError:
+            await message.answer("❌ Faqat raqam kiriting!")
+    elif field == "voice":
+        cursor.execute("UPDATE media SET voice = ? WHERE id = ?", (value, media_id))
+        conn.commit()
+        await message.answer("✅ Ovoz o'zgartirildi!")
+    elif field == "sponsor":
+        cursor.execute("UPDATE media SET sponsor = ? WHERE id = ?", (value, media_id))
+        conn.commit()
+        await message.answer("✅ Himoy o'zgartirildi!")
+    elif field == "quality":
+        cursor.execute("UPDATE media SET quality = ? WHERE id = ?", (value, media_id))
+        conn.commit()
+        await message.answer("✅ Sifat o'zgartirildi!")
+    
+    await state.clear()
+
+@dp.message(EditMediaState.value, F.photo)
+async def edit_media_image_photo(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    cursor.execute("UPDATE media SET image_url = ? WHERE id = ?", (message.photo[-1].file_id, data['media_id']))
+    conn.commit()
+    await message.answer("✅ Rasm o'zgartirildi!")
+    await state.clear()
+
+# ========== QISMNI TAHRIRLASH ==========
+@dp.message(F.text == "✏️ Qismni Tahrirlash")
+async def edit_part_start(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id): return
+    await message.answer("Qaysi animega tegishli qismni tahrirlamoqchisiz?\nAnime nomi yoki kodini kiriting:", parse_mode="HTML")
+    await state.set_state(EditPartState.select_media)
+
+@dp.message(EditPartState.select_media)
+async def edit_part_select_media(message: types.Message, state: FSMContext):
+    query = message.text.strip()
+    try:
+        code = int(query)
+        cursor.execute("SELECT id, name FROM media WHERE code = ?", (code,))
+    except ValueError:
+        cursor.execute("SELECT id, name FROM media WHERE name LIKE ?", (f"%{query}%",))
+    
+    media = cursor.fetchone()
+    if not media:
+        await message.answer(f"❌ '{query}' bo'yicha media topilmadi! Qayta kiriting:")
+        return
+    
+    media_id, media_name = media
+    await state.update_data(media_id=media_id)
+    await message.answer(f"📺 <b>{media_name}</b>\n\nQism tanlang:", reply_markup=parts_list_keyboard(media_id), parse_mode="HTML")
+    await state.set_state(EditPartState.select_part)
+
+@dp.callback_query(EditPartState.select_part, F.data.startswith("select_part_"))
+async def edit_part_select_part(callback: CallbackQuery, state: FSMContext):
+    part_id = int(callback.data.split("_")[2])
+    await state.update_data(part_id=part_id)
+    cursor.execute("SELECT media_id, part_number FROM parts WHERE id = ?", (part_id,))
+    media_id, part_num = cursor.fetchone()
+    try:
+        await callback.message.edit_text(f"✏️ {part_num}-qismni tahrirlash\n\nQaysi maydonni tahrirlamoqchisiz?", reply_markup=edit_part_fields_keyboard(part_id, media_id), parse_mode="HTML")
+    except:
+        await safe_send_message(callback.from_user.id, f"✏️ {part_num}-qismni tahrirlash\n\nQaysi maydonni tahrirlamoqchisiz?", reply_markup=edit_part_fields_keyboard(part_id, media_id), parse_mode="HTML")
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("edit_part_"))
+async def edit_part_field(callback: CallbackQuery, state: FSMContext):
+    parts = callback.data.split("_")
+    part_id = int(parts[2])
+    field = parts[3]
+    await state.update_data(part_id=part_id, field=field)
+    field_names = {"video": "yangi videoni", "caption": "yangi captionni", "number": "yangi qism raqamini"}
+    try:
+        await callback.message.edit_text(f"✏️ {field_names.get(field, 'yangi qiymatini')} kiriting:")
+    except:
+        await safe_send_message(callback.from_user.id, f"✏️ {field_names.get(field, 'yangi qiymatini')} kiriting:")
+    await state.set_state(EditPartState.value)
+    await callback.answer()
+
+@dp.message(EditPartState.value, F.video)
+async def edit_part_video(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    cursor.execute("UPDATE parts SET file_id = ? WHERE id = ?", (message.video.file_id, data['part_id']))
+    conn.commit()
+    await message.answer("✅ Video o'zgartirildi!")
+    await state.clear()
+
+@dp.message(EditPartState.value, F.text)
+async def edit_part_value(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    part_id = data['part_id']
+    field = data['field']
+    value = message.text
+    if field == "caption":
+        cursor.execute("UPDATE parts SET caption = ? WHERE id = ?", (value, part_id))
+        conn.commit()
+        await message.answer("✅ Caption o'zgartirildi!")
+    elif field == "number":
+        try:
+            part_num = int(value)
+            cursor.execute("SELECT media_id FROM parts WHERE id = ?", (part_id,))
+            media_id = cursor.fetchone()[0]
+            cursor.execute("SELECT id FROM parts WHERE media_id = ? AND part_number = ? AND id != ?", (media_id, part_num, part_id))
+            if cursor.fetchone():
+                await message.answer(f"⚠️ {part_num}-qism mavjud!")
+            else:
+                cursor.execute("UPDATE parts SET part_number = ? WHERE id = ?", (part_num, part_id))
+                conn.commit()
+                await message.answer(f"✅ Qism raqami {part_num} ga o'zgartirildi!")
+        except ValueError:
+            await message.answer("❌ Faqat raqam kiriting!")
+    await state.clear()
+
+# ========== STATISTIKA ==========
+@dp.message(F.text == "📊 Statistika")
+async def show_stats(message: types.Message):
+    if not is_admin(message.from_user.id): return
+    users = cursor.execute("SELECT COUNT(*) FROM users WHERE is_blocked = 0").fetchone()[0]
+    media = cursor.execute("SELECT COUNT(*) FROM media").fetchone()[0]
+    parts = cursor.execute("SELECT COUNT(*) FROM parts").fetchone()[0]
+    views = cursor.execute("SELECT SUM(views) FROM media").fetchone()[0] or 0
+    admins = cursor.execute("SELECT COUNT(*) FROM admins").fetchone()[0]
+    ratings = cursor.execute("SELECT COUNT(*) FROM ratings").fetchone()[0]
+    await message.answer(f"📊 <b>Statistika</b>\n\n👥 Foydalanuvchilar: {users}\n🎬 Media: {media}\n📹 Qismlar: {parts}\n👁️ Ko'rishlar: {views}\n⭐ Reytinglar: {ratings}\n👑 Adminlar: {admins}", parse_mode="HTML")
+
+# ========== XABAR YUBORISH ==========
+@dp.message(F.text == "📢 Xabar Yuborish")
+async def broadcast_start(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id): return
+    await message.answer("📢 Xabar yuborish\n\nXabaringizni kiriting:", parse_mode="HTML")
+    await state.set_state(BroadcastState.message)
+
+@dp.message(BroadcastState.message)
+async def broadcast_send(message: types.Message, state: FSMContext):
+    users = cursor.execute("SELECT id FROM users WHERE is_blocked = 0").fetchall()
+    sent = 0
+    for user in users:
+        try:
+            if message.photo:
+                await bot.send_photo(user[0], message.photo[-1].file_id, caption=message.caption)
+            elif message.video:
+                await bot.send_video(user[0], message.video.file_id, caption=message.caption)
+            else:
+                await bot.send_message(user[0], message.text, parse_mode="HTML")
+            sent += 1
+        except:
+            pass
+    await message.answer(f"✅ {sent}/{len(users)} ta foydalanuvchiga yuborildi!")
+    await state.clear()
+
+# ========== MAJBURIY A'ZO (ADMIN PANEL) ==========
+@dp.message(F.text == "🔗 Majburiy A'zo")
+async def forced_subscribe_menu(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id): return
+    await message.answer("🔗 Majburiy a'zolik boshqaruvi:", reply_markup=forced_channel_buttons(), parse_mode="HTML")
+    await state.set_state(ForcedChannelState.action)
+
+@dp.callback_query(ForcedChannelState.action, F.data == "forced_add_telegram")
+async def forced_add_telegram(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(action="add", channel_type="telegram")
+    try:
+        await callback.message.edit_text("➕ Telegram kanal username yoki linkini yuboring:\nMasalan: @kanal yoki https://t.me/kanal")
+    except:
+        await safe_send_message(callback.from_user.id, "➕ Telegram kanal username yoki linkini yuboring:\nMasalan: @kanal yoki https://t.me/kanal")
+    await callback.answer()
+
+@dp.callback_query(ForcedChannelState.action, F.data == "forced_add_instagram")
+async def forced_add_instagram(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(action="add", channel_type="instagram")
+    try:
+        await callback.message.edit_text("📸 Instagram username yoki linkini yuboring:\nMasalan: @username yoki https://instagram.com/username")
+    except:
+        await safe_send_message(callback.from_user.id, "📸 Instagram username yoki linkini yuboring:\nMasalan: @username yoki https://instagram.com/username")
+    await callback.answer()
+
+@dp.callback_query(ForcedChannelState.action, F.data == "forced_add_youtube")
+async def forced_add_youtube(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(action="add", channel_type="youtube")
+    try:
+        await callback.message.edit_text("▶️ YouTube kanal linkini yuboring:\nMasalan: https://youtube.com/c/kanal")
+    except:
+        await safe_send_message(callback.from_user.id, "▶️ YouTube kanal linkini yuboring:\nMasalan: https://youtube.com/c/kanal")
+    await callback.answer()
+
+@dp.callback_query(ForcedChannelState.action, F.data == "forced_remove")
+async def forced_remove_start(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(action="remove")
+    try:
+        await callback.message.edit_text("❌ O'chirmoqchi bo'lgan kanalni tanlang:", reply_markup=forced_channel_list_keyboard())
+    except:
+        await safe_send_message(callback.from_user.id, "❌ O'chirmoqchi bo'lgan kanalni tanlang:", reply_markup=forced_channel_list_keyboard())
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("forced_remove_"))
+async def forced_remove_channel(callback: CallbackQuery, state: FSMContext):
+    channel_id = int(callback.data.split("_")[2])
+    cursor.execute("DELETE FROM forced_channels WHERE id = ?", (channel_id,))
+    conn.commit()
+    try:
+        await callback.message.edit_text("✅ Kanal o'chirildi!", reply_markup=forced_channel_list_keyboard())
+    except:
+        await safe_send_message(callback.from_user.id, "✅ Kanal o'chirildi!", reply_markup=forced_channel_list_keyboard())
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("forced_page_"))
+async def forced_page_callback(callback: CallbackQuery, state: FSMContext):
+    page = int(callback.data.split("_")[2])
+    try:
+        await callback.message.edit_text("❌ O'chirmoqchi bo'lgan kanalni tanlang:", reply_markup=forced_channel_list_keyboard(page))
+    except:
+        await safe_send_message(callback.from_user.id, "❌ O'chirmoqchi bo'lgan kanalni tanlang:", reply_markup=forced_channel_list_keyboard(page))
+    await callback.answer()
+
+@dp.callback_query(F.data == "back_to_forced_menu")
+async def back_to_forced_menu(callback: CallbackQuery, state: FSMContext):
+    try:
+        await callback.message.edit_text("🔗 Majburiy a'zolik boshqaruvi:", reply_markup=forced_channel_buttons(), parse_mode="HTML")
+    except:
+        await safe_send_message(callback.from_user.id, "🔗 Majburiy a'zolik boshqaruvi:", reply_markup=forced_channel_buttons(), parse_mode="HTML")
+    await callback.answer()
+
+@dp.message(ForcedChannelState.action, F.text)
+async def forced_add_channel(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    if data.get('action') != "add":
+        await state.clear()
+        return
+    
+    channel_input = message.text.strip()
+    channel_type = data.get('channel_type', 'telegram')
+    
+    if channel_type == "telegram":
+        if channel_input.startswith("https://t.me/"):
+            channel = "@" + channel_input.split("/")[-1]
+        elif channel_input.startswith("@"):
+            channel = channel_input
+        else:
+            channel = "@" + channel_input
+    elif channel_type == "instagram":
+        if channel_input.startswith("https://instagram.com/"):
+            channel = "@" + channel_input.split("/")[-1]
+        elif channel_input.startswith("https://www.instagram.com/"):
+            channel = "@" + channel_input.split("/")[-1]
+        elif channel_input.startswith("@"):
+            channel = channel_input
+        else:
+            channel = "@" + channel_input
+    else:  # youtube
+        channel = channel_input
+    
+    try:
+        cursor.execute("INSERT INTO forced_channels (channel_username, channel_type, is_active) VALUES (?, ?, ?)",
+                       (channel, channel_type, 1))
+        conn.commit()
+        type_text = "Telegram" if channel_type == "telegram" else "Instagram" if channel_type == "instagram" else "YouTube"
+        await message.answer(f"✅ {type_text} kanali majburiy a'zolik ro'yxatiga qo'shildi!")
+    except sqlite3.IntegrityError:
+        await message.answer(f"⚠️ Bu kanal allaqachon ro'yxatda!")
+    
+    await state.clear()
+
+# ========== ADMIN QO'SHISH/CHIQARISH ==========
+@dp.message(F.text == "👑 Admin Qo'shish")
+async def admin_manage(message: types.Message, state: FSMContext):
+    if not is_owner(message.from_user.id):
+        await message.answer("❌ Faqat ownerlar admin qo'shishi mumkin!")
+        return
+    await message.answer("Admin boshqaruvi:", reply_markup=admin_manage_buttons(), parse_mode="HTML")
+    await state.set_state(AdminManageState.action)
+
+@dp.callback_query(AdminManageState.action, F.data == "admin_add")
+async def admin_add_request(callback: CallbackQuery, state: FSMContext):
+    if not is_owner(callback.from_user.id):
+        await callback.answer("❌ Faqat ownerlar admin qo'shishi mumkin!", show_alert=True)
+        return
+    await state.update_data(action="add")
+    try:
+        await callback.message.edit_text("➕ Yangi admin ID sini kiriting:", parse_mode="HTML")
+    except:
+        await safe_send_message(callback.from_user.id, "➕ Yangi admin ID sini kiriting:", parse_mode="HTML")
+    await state.set_state(AdminManageState.user_id)
+    await callback.answer()
+
+@dp.callback_query(AdminManageState.action, F.data == "admin_remove")
+async def admin_remove_request(callback: CallbackQuery, state: FSMContext):
+    if not is_owner(callback.from_user.id):
+        await callback.answer("❌ Faqat ownerlar admin chiqarishi mumkin!", show_alert=True)
+        return
+    await state.update_data(action="remove")
+    admins = cursor.execute("SELECT user_id FROM admins WHERE user_id NOT IN ({})".format(','.join('?' for _ in OWNERS)), OWNERS).fetchall()
+    if admins:
+        text = "❌ Admin chiqarish:\n\nMavjud adminlar:\n" + "\n".join([f"• {a[0]}" for a in admins]) + "\n\nO'chirmoqchi bo'lgan ID ni kiriting:"
+        try:
+            await callback.message.edit_text(text, parse_mode="HTML")
+        except:
+            await safe_send_message(callback.from_user.id, text, parse_mode="HTML")
+    else:
+        try:
+            await callback.message.edit_text("❌ O'chirish mumkin bo'lgan admin yo'q!")
+        except:
+            await safe_send_message(callback.from_user.id, "❌ O'chirish mumkin bo'lgan admin yo'q!")
+        await state.clear()
+    await state.set_state(AdminManageState.user_id)
+    await callback.answer()
+
+@dp.message(AdminManageState.user_id)
+async def admin_manage_user_id(message: types.Message, state: FSMContext):
+    try:
+        user_id = int(message.text)
+        data = await state.get_data()
+        if data['action'] == "add":
+            cursor.execute("INSERT OR IGNORE INTO admins (user_id, added_by, added_at) VALUES (?, ?, ?)", (user_id, message.from_user.id, datetime.now().isoformat()))
+            conn.commit()
+            await message.answer(f"✅ {user_id} admin qo'shildi!" if cursor.rowcount > 0 else f"⚠️ {user_id} allaqachon admin!")
+            try:
+                await bot.send_message(user_id, "🎉 Siz admin etib tayinlandingiz!\n/admin orqali panelga kiring.")
+            except:
+                pass
+        else:
+            if user_id in OWNERS:
+                await message.answer("❌ Ownerlarni o'chirib bo'lmaydi!")
+            else:
+                cursor.execute("DELETE FROM admins WHERE user_id = ?", (user_id,))
+                conn.commit()
+                await message.answer(f"✅ {user_id} adminlikdan chiqarildi!" if cursor.rowcount > 0 else f"⚠️ {user_id} admin emas!")
+    except ValueError:
+        await message.answer("❌ Faqat raqam kiriting!")
+    await state.clear()
+
+# ========== POST QILISH (YANGI FORMAT) ==========
+@dp.message(F.text == "📨 Post Qilish")
+async def post_start(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id): return
+    await message.answer("📨 Post qilish\n\nPost qilmoqchi bo'lgan media nomi yoki kodini kiriting:", parse_mode="HTML")
+    await state.set_state(PostState.media_id)
+
+@dp.message(PostState.media_id)
+async def post_media_id(message: types.Message, state: FSMContext):
+    query = message.text.strip()
+    try:
+        code = int(query)
+        cursor.execute("SELECT id, name, code, description, total_parts, status, season, genre, voice, sponsor, quality, image_url, rating, rating_count FROM media WHERE code = ?", (code,))
+    except ValueError:
+        cursor.execute("SELECT id, name, code, description, total_parts, status, season, genre, voice, sponsor, quality, image_url, rating, rating_count FROM media WHERE name LIKE ?", (f"%{query}%",))
+    media = cursor.fetchone()
+    if not media:
+        await message.answer(f"❌ '{query}' bo'yicha media topilmadi!")
+        return
+    media_id, name, code, desc, total_parts, status, season, genre, voice, sponsor, quality, image, rating, rating_count = media
+    await state.update_data(media_id=media_id, media_name=name, media_code=code, media_image=image)
+    
+    post = format_media_post((name, "", genre, status, season, total_parts, 0, code, voice, sponsor, quality, rating, rating_count))
+    
+    await message.answer(
+        f"📨 <b>Quyidagi post yuboriladi:</b>\n\n{post}\n\n"
+        "Endi post qilmoqchi bo'lgan kanal linkini yuboring:\n"
+        "Masalan: @kanal yoki https://t.me/kanal",
+        parse_mode="HTML"
+    )
+    await state.set_state(PostState.channel)
+
+@dp.message(PostState.channel)
+async def post_channel(message: types.Message, state: FSMContext):
+    channel_input = message.text.strip()
+    if channel_input.startswith("https://t.me/"):
+        channel = "@" + channel_input.split("/")[-1]
+    elif channel_input.startswith("@"):
+        channel = channel_input
+    else:
+        channel = "@" + channel_input
+    
+    await state.update_data(channel=channel)
+    
+    data = await state.get_data()
+    media_id = data['media_id']
+    name = data['media_name']
+    code = data['media_code']
+    image = data.get('media_image')
+    
+    cursor.execute("SELECT total_parts, status, season, genre, voice, sponsor, quality, rating, rating_count FROM media WHERE id = ?", (media_id,))
+    total_parts, status, season, genre, voice, sponsor, quality, rating, rating_count = cursor.fetchone()
+    
+    post = format_media_post((name, "", genre, status, season, total_parts, 0, code, voice, sponsor, quality, rating, rating_count))
+    
+    bot_info = await bot.get_me()
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📺 Tomosha qilish", url=f"https://t.me/{bot_info.username}?start=code_{code}")]
+    ])
+    
+    await message.answer(f"📨 <b>Post tayyor!</b>\n\nKanal: {channel}\n\nTasdiqlaysizmi?", reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Tasdiqlash", callback_data="confirm_post")],
+        [InlineKeyboardButton(text="❌ Bekor qilish", callback_data="cancel_post")]
+    ]), parse_mode="HTML")
+    await state.set_state(PostState.confirm)
+
+@dp.callback_query(PostState.confirm, F.data == "confirm_post")
+async def post_confirm(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    media_id = data['media_id']
+    channel = data['channel']
+    name = data['media_name']
+    code = data['media_code']
+    image = data.get('media_image')
+    
+    cursor.execute("SELECT total_parts, status, season, genre, voice, sponsor, quality, rating, rating_count FROM media WHERE id = ?", (media_id,))
+    total_parts, status, season, genre, voice, sponsor, quality, rating, rating_count = cursor.fetchone()
+    
+    post = format_media_post((name, "", genre, status, season, total_parts, 0, code, voice, sponsor, quality, rating, rating_count))
+    
+    bot_info = await bot.get_me()
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📺 Tomosha qilish", url=f"https://t.me/{bot_info.username}?start=code_{code}")]
+    ])
+    
+    try:
+        if image and (image.startswith("http") or image.startswith("AgA")):
+            await bot.send_photo(chat_id=channel, photo=image, caption=post, reply_markup=keyboard, parse_mode="HTML")
+        else:
+            await bot.send_message(chat_id=channel, text=post, reply_markup=keyboard, parse_mode="HTML")
+        try:
+            await callback.message.edit_text(f"✅ Post muvaffaqiyatli yuborildi!\n\nKanal: {channel}")
+        except:
+            await safe_send_message(callback.from_user.id, f"✅ Post muvaffaqiyatli yuborildi!\n\nKanal: {channel}")
+    except Exception as e:
+        try:
+            await callback.message.edit_text(f"❌ Xatolik: {e}")
+        except:
+            await safe_send_message(callback.from_user.id, f"❌ Xatolik: {e}")
+    await state.clear()
+    await callback.answer()
+
+@dp.callback_query(PostState.confirm, F.data == "cancel_post")
+async def post_cancel(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    try:
+        await callback.message.delete()
+    except:
+        pass
+    await callback.answer()
+
+# ========== QISMNI POST QILISH (YANGI FORMAT) ==========
+@dp.message(F.text == "🎬 Qismni Post Qilish")
+async def part_post_start(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id): return
+    await message.answer("🎬 Qismni post qilish\n\nPost qilmoqchi bo'lgan media nomi yoki kodini kiriting:", parse_mode="HTML")
+    await state.set_state(PartPostState.media_id)
+
+@dp.message(PartPostState.media_id)
+async def part_post_media_id(message: types.Message, state: FSMContext):
+    query = message.text.strip()
+    try:
+        code = int(query)
+        cursor.execute("SELECT id, name, code, image_url FROM media WHERE code = ?", (code,))
+    except ValueError:
+        cursor.execute("SELECT id, name, code, image_url FROM media WHERE name LIKE ?", (f"%{query}%",))
+    media = cursor.fetchone()
+    if not media:
+        await message.answer(f"❌ '{query}' bo'yicha media topilmadi!")
+        return
+    media_id, name, code, image = media
+    await state.update_data(media_id=media_id)
+    await state.update_data(media_image=image)
+    await state.update_data(media_name=name)
+    await state.update_data(media_code=code)
+    await message.answer(f"📺 <b>{name}</b> (Kod: {code})\n\nQaysi qismni post qilmoqchisiz?", reply_markup=parts_list_keyboard(media_id), parse_mode="HTML")
+    await state.set_state(PartPostState.part_id)
+
+@dp.callback_query(PartPostState.part_id, F.data.startswith("select_part_"))
+async def part_post_select_part(callback: CallbackQuery, state: FSMContext):
+    part_id = int(callback.data.split("_")[2])
+    await state.update_data(part_id=part_id)
+    cursor.execute("SELECT p.part_number, m.name, m.code FROM parts p JOIN media m ON p.media_id = m.id WHERE p.id = ?", (part_id,))
+    part_num, media_name, code = cursor.fetchone()
+    
+    post = format_part_post(media_name, part_num, code)
+    
+    try:
+        await callback.message.edit_text(
+            f"📨 <b>Quyidagi post yuboriladi:</b>\n\n{post}\n\n"
+            "Endi post qilmoqchi bo'lgan kanal linkini yuboring:\n"
+            "Masalan: @kanal yoki https://t.me/kanal",
+            parse_mode="HTML"
+        )
+    except:
+        await safe_send_message(callback.from_user.id,
+            f"📨 <b>Quyidagi post yuboriladi:</b>\n\n{post}\n\n"
+            "Endi post qilmoqchi bo'lgan kanal linkini yuboring:\n"
+            "Masalan: @kanal yoki https://t.me/kanal",
+            parse_mode="HTML"
+        )
+    await state.update_data(part_number=part_num)
+    await state.set_state(PartPostState.channel)
+    await callback.answer()
+
+@dp.message(PartPostState.channel)
+async def part_post_channel(message: types.Message, state: FSMContext):
+    channel_input = message.text.strip()
+    if channel_input.startswith("https://t.me/"):
+        channel = "@" + channel_input.split("/")[-1]
+    elif channel_input.startswith("@"):
+        channel = channel_input
+    else:
+        channel = "@" + channel_input
+    
+    await state.update_data(channel=channel)
+    
+    data = await state.get_data()
+    part_num = data.get('part_number')
+    media_name = data.get('media_name')
+    media_code = data.get('media_code')
+    media_image = data.get('media_image')
+    
+    post = format_part_post(media_name, part_num, media_code)
+    
+    bot_info = await bot.get_me()
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"📺 {part_num}-qismni tomosha qilish", url=f"https://t.me/{bot_info.username}?start=code_{media_code}&part={part_num}")]
+    ])
+    
+    await message.answer(f"📨 <b>Post tayyor!</b>\n\nKanal: {channel}\n\n{post}\n\nTasdiqlaysizmi?", 
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                            [InlineKeyboardButton(text="✅ Tasdiqlash", callback_data="confirm_part_post")],
+                            [InlineKeyboardButton(text="❌ Bekor qilish", callback_data="cancel_post")]
+                        ]), parse_mode="HTML")
+    await state.set_state(PartPostState.confirm)
+
+@dp.callback_query(PartPostState.confirm, F.data == "confirm_part_post")
+async def part_post_confirm(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    part_num = data.get('part_number')
+    media_name = data.get('media_name')
+    media_code = data.get('media_code')
+    media_image = data.get('media_image')
+    channel = data.get('channel')
+    
+    post = format_part_post(media_name, part_num, media_code)
+    
+    bot_info = await bot.get_me()
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"📺 {part_num}-qismni tomosha qilish", url=f"https://t.me/{bot_info.username}?start=code_{media_code}&part={part_num}")]
+    ])
+    
+    try:
+        if media_image:
+            await bot.send_photo(chat_id=channel, photo=media_image, caption=post, reply_markup=keyboard, parse_mode="HTML")
+        else:
+            await bot.send_message(chat_id=channel, text=post, reply_markup=keyboard, parse_mode="HTML")
+        try:
+            await callback.message.edit_text(f"✅ Qism post qilindi!\n\nKanal: {channel}")
+        except:
+            await safe_send_message(callback.from_user.id, f"✅ Qism post qilindi!\n\nKanal: {channel}")
+    except Exception as e:
+        try:
+            await callback.message.edit_text(f"❌ Xatolik: {e}")
+        except:
+            await safe_send_message(callback.from_user.id, f"❌ Xatolik: {e}")
+    await state.clear()
+    await callback.answer()
+
+@dp.callback_query(PartPostState.confirm, F.data == "cancel_post")
+async def part_post_cancel(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    try:
+        await callback.message.delete()
+    except:
+        pass
+    await callback.answer()
+
+# ========== BOSHQA CALLBACKLAR ==========
+@dp.callback_query(F.data == "cancel_post")
+async def cancel_post(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    try:
+        await callback.message.delete()
+    except:
+        pass
+    await callback.answer()
+
+@dp.callback_query(F.data == "cancel_add_admin")
+async def cancel_add_admin(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    try:
+        await callback.message.delete()
+    except:
+        pass
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("media_page_"))
+async def media_page_callback(callback: CallbackQuery):
+    parts = callback.data.split("_")
+    page = int(parts[2])
+    media_type = parts[3] if len(parts) > 3 and parts[3] != 'None' else None
+    try:
+        await callback.message.edit_text("Media tanlang:", reply_markup=media_list_keyboard(media_type, page))
+    except:
+        await safe_send_message(callback.from_user.id, "Media tanlang:", reply_markup=media_list_keyboard(media_type, page))
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("parts_page_"))
+async def parts_page_callback(callback: CallbackQuery):
+    _, media_id, page = callback.data.split("_")
+    try:
+        await callback.message.edit_text("Qism tanlang:", reply_markup=parts_list_keyboard(int(media_id), int(page)))
+    except:
+        await safe_send_message(callback.from_user.id, "Qism tanlang:", reply_markup=parts_list_keyboard(int(media_id), int(page)))
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("back_to_media_"))
+async def back_to_media_callback(callback: CallbackQuery):
+    try:
+        await callback.message.edit_text("Media tanlang:", reply_markup=media_list_keyboard())
+    except:
+        await safe_send_message(callback.from_user.id, "Media tanlang:", reply_markup=media_list_keyboard())
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("back_to_parts_"))
+async def back_to_parts_callback(callback: CallbackQuery):
+    media_id = int(callback.data.split("_")[3])
+    try:
+        await callback.message.edit_text("Qism tanlang:", reply_markup=parts_list_keyboard(media_id))
+    except:
+        await safe_send_message(callback.from_user.id, "Qism tanlang:", reply_markup=parts_list_keyboard(media_id))
+    await callback.answer()
+
+# ========== ERROR HANDLER ==========
+@dp.message()
+async def handle_unknown(message: types.Message):
+    # Bot javob bermaydi
+    pass
+
+# ========== BOTNI ISHGA TUSHIRISH ==========
+async def main():
+    print("=" * 50)
+    print("🎬 Animedia FUN DUB Bot ishga tushmoqda...")
+    print("=" * 50)
+    print(f"👑 Ownerlar: {OWNERS}")
+    print(f"📢 Asosiy kanal: {MAIN_CHANNEL}")
+    print(f"👨‍💻 Muallif: {AUTHOR_USERNAME} ({AUTHOR_LINK})")
+    print(f"🆘 Yordam: {SUPPORT_USERNAME} ({SUPPORT_LINK})")
+    print("=" * 50)
+    
+    # Webhookni o'chirish
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+        print("✅ Webhook muvaffaqiyatli o'chirildi!")
+    except Exception as e:
+        print(f"⚠️ Webhook o'chirishda xatolik: {e}")
+    
+    print("✅ Bot muvaffaqiyatli ishga tushdi!")
+    print("=" * 50)
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
